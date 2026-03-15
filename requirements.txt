@@ -1,0 +1,8 @@
+streamlit
+yfinance
+pandas
+plotly
+google-search-results
+autogen-agentchat
+autogen-ext[openai]
+openai
