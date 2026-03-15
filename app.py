@@ -307,6 +307,22 @@ def _extract_result_text(task_result: Any) -> str:
     return "No report generated."
 
 
+async def _safe_run_agent(agent: AssistantAgent, task: str, retries: int = 3, delay: int = 6):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return await agent.run(task=task)
+        except Exception as e:
+            last_error = e
+            message = str(e).lower()
+            if "rate limit" in message or "too many requests" in message:
+                if attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                    continue
+            raise e
+    raise last_error
+
+
 async def _run_autogen_analysis(
     groq_api_key: str,
     company_name: str,
@@ -317,7 +333,7 @@ async def _run_autogen_analysis(
     horizon: str,
 ) -> Tuple[str, str, str]:
     model_client = OpenAIChatCompletionClient(
-        model="llama-3.3-70b-versatile",
+        model="llama-3.1-8b-instant",
         base_url="https://api.groq.com/openai/v1",
         api_key=groq_api_key,
         temperature=0.3,
@@ -360,7 +376,8 @@ async def _run_autogen_analysis(
     )
 
     try:
-        news_result = await news_agent.run(
+        news_result = await _safe_run_agent(
+            news_agent,
             task=f"""
 Analyze these latest news items for {company_name} ({ticker}).
 
@@ -376,11 +393,12 @@ Return markdown with these sections:
 2. Bullish Catalysts
 3. Bearish Risks
 4. What Investors Should Watch
-"""
+""",
         )
         news_summary = _extract_result_text(news_result)
 
-        technical_result = await technical_agent.run(
+        technical_result = await _safe_run_agent(
+            technical_agent,
             task=f"""
 Analyze this market snapshot for {company_name} ({ticker}).
 
@@ -397,11 +415,12 @@ Return markdown with these sections:
 3. Technical Strengths
 4. Technical Weaknesses
 5. Near-Term Setup
-"""
+""",
         )
         technical_summary = _extract_result_text(technical_result)
 
-        final_result = await investment_agent.run(
+        final_result = await _safe_run_agent(
+            investment_agent,
             task=f"""
 Create a final investor report for {company_name} ({ticker}).
 
@@ -431,7 +450,7 @@ Requirements:
 - Include a confidence score from 0 to 100.
 - Include a risk level: Low, Medium, or High.
 - Keep it practical and under about 500 words.
-"""
+""",
         )
         final_report = _extract_result_text(final_result)
         return final_report, news_summary, technical_summary
@@ -659,5 +678,9 @@ try:
     )
 
 except Exception as e:
-    st.error(f"Something went wrong: {e}")
+    error_text = str(e).lower()
+    if "rate limit" in error_text or "too many requests" in error_text:
+        st.warning("⚠️ Groq API rate limit reached. Please wait a little and try again.")
+    else:
+        st.error(f"Something went wrong: {e}")
     st.stop()
