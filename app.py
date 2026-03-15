@@ -100,10 +100,6 @@ st.markdown(
             color: #cbd5e1;
             font-size: 0.94rem;
         }
-        .small-note {
-            color: #94a3b8;
-            font-size: 0.84rem;
-        }
     </style>
     """,
     unsafe_allow_html=True,
@@ -124,10 +120,8 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
     avg_gain = gain.rolling(window=period).mean()
     avg_loss = loss.rolling(window=period).mean()
-
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -178,16 +172,12 @@ def recommendation_css_class(rec: str) -> str:
 
 def extract_confidence(text: str) -> str:
     match = re.search(r"confidence[^0-9]{0,20}(\d{1,3})", text, flags=re.IGNORECASE)
-    if match:
-        return f"{match.group(1)}%"
-    return "N/A"
+    return f"{match.group(1)}%" if match else "N/A"
 
 
 def extract_risk(text: str) -> str:
     match = re.search(r"risk level[^A-Za-z]{0,20}(low|medium|high)", text, flags=re.IGNORECASE)
-    if match:
-        return match.group(1).capitalize()
-    return "N/A"
+    return match.group(1).capitalize() if match else "N/A"
 
 
 def summarize_signal(latest: pd.Series) -> Tuple[str, str]:
@@ -229,7 +219,7 @@ def get_stock_news(
     company_name: str,
     ticker: str,
     serpapi_key: str,
-    num_results: int = 6,
+    num_results: int = 5,
 ) -> List[Dict[str, str]]:
     if not serpapi_key:
         return []
@@ -316,7 +306,7 @@ Dividend Yield: {info.get('dividendYield', 'N/A')}
 
 
 # =========================================================
-# AUTOGEN + GEMINI
+# AUTOGEN + GEMINI (2 AGENTS)
 # =========================================================
 def _extract_result_text(task_result: Any) -> str:
     messages = getattr(task_result, "messages", [])
@@ -334,8 +324,8 @@ async def _safe_run_agent(agent: AssistantAgent, task: str, retries: int = 3, de
             return await agent.run(task=task)
         except Exception as e:
             last_error = e
-            message = str(e).lower()
-            if any(x in message for x in ["rate limit", "too many requests", "429"]) and attempt < retries - 1:
+            msg = str(e).lower()
+            if any(x in msg for x in ["rate limit", "too many requests", "429", "resource_exhausted"]) and attempt < retries - 1:
                 await asyncio.sleep(delay)
                 continue
             raise e
@@ -350,9 +340,9 @@ async def _run_autogen_analysis(
     news_text: str,
     risk_profile: str,
     horizon: str,
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str]:
     model_client = OpenAIChatCompletionClient(
-        model="gemini-3-flash-preview",
+        model="gemini-2.5-flash",
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         api_key=gemini_key,
         model_info={
@@ -364,39 +354,30 @@ async def _run_autogen_analysis(
         },
     )
 
-    news_agent = AssistantAgent(
-        name="news_analyst",
+    analysis_agent = AssistantAgent(
+        name="market_research_analyst",
         model_client=model_client,
         system_message=(
-            "You are a market news analyst. Analyze stock-related news for sentiment, bullish catalysts, "
-            "bearish risks, and key watchpoints for investors. Be balanced and concise."
+            "You are a senior stock research analyst. Analyze both stock news and technical indicators. "
+            "Be concise, balanced, practical, and investor-focused."
         ),
     )
 
-    technical_agent = AssistantAgent(
-        name="technical_analyst",
-        model_client=model_client,
-        system_message=(
-            "You are a technical market analyst. Use RSI, MACD, MA20, MA50, price action, and short-term trend "
-            "to explain the setup clearly and practically."
-        ),
-    )
-
-    investment_agent = AssistantAgent(
+    decision_agent = AssistantAgent(
         name="investment_committee",
         model_client=model_client,
         system_message=(
-            "You are the chair of an investment committee. Combine the news and technical analysis into one concise "
-            "investor report. End with exactly one recommendation: BUY, HOLD, or SELL. Include confidence score "
-            "from 0 to 100 and risk level Low, Medium, or High. This is educational analysis, not guaranteed advice."
+            "You are an investment committee chair. Convert research analysis into a final investor report. "
+            "State exactly one recommendation: BUY, HOLD, or SELL. Include confidence score 0-100 and risk level "
+            "Low, Medium, or High. This is educational analysis, not guaranteed advice."
         ),
     )
 
     try:
-        news_result = await _safe_run_agent(
-            news_agent,
+        research_result = await _safe_run_agent(
+            analysis_agent,
             task=f"""
-Analyze the latest news for {company_name} ({ticker}).
+Analyze {company_name} ({ticker}) using both the news and technical snapshot below.
 
 Investor profile:
 - Risk appetite: {risk_profile}
@@ -405,72 +386,46 @@ Investor profile:
 News:
 {news_text}
 
-Return markdown with these sections:
-1. Overall Sentiment
-2. Bullish Catalysts
-3. Bearish Risks
-4. What Investors Should Watch
-""",
-        )
-        news_summary = _extract_result_text(news_result)
-
-        technical_result = await _safe_run_agent(
-            technical_agent,
-            task=f"""
-Analyze this market snapshot for {company_name} ({ticker}).
-
-Investor profile:
-- Risk appetite: {risk_profile}
-- Time horizon: {horizon}
-
-Market snapshot:
+Technical snapshot:
 {market_snapshot}
 
 Return markdown with these sections:
-1. Trend
-2. Momentum
-3. Technical Strengths
-4. Technical Weaknesses
-5. Near-Term Setup
+1. Overall Sentiment
+2. Bullish Drivers
+3. Bearish Risks
+4. Technical Interpretation
+5. What Investors Should Watch
 """,
         )
-        technical_summary = _extract_result_text(technical_result)
+        research_summary = _extract_result_text(research_result)
 
         final_result = await _safe_run_agent(
-            investment_agent,
+            decision_agent,
             task=f"""
-Create a final investor report for {company_name} ({ticker}).
+Using the following research analysis, create a final investor report for {company_name} ({ticker}).
 
-Investor profile:
-- Risk appetite: {risk_profile}
-- Time horizon: {horizon}
-
-News analysis:
-{news_summary}
-
-Technical analysis:
-{technical_summary}
+Research analysis:
+{research_summary}
 
 Return markdown with these exact sections:
 1. Executive Summary
-2. News Highlights
+2. News and Market Drivers
 3. Technical Analysis
-4. Fundamental/Business Context
-5. Final Recommendation
-6. Risk Level and Confidence
-7. Short-Term Outlook
-8. Important Disclaimer
+4. Final Recommendation
+5. Risk Level and Confidence
+6. Short-Term Outlook
+7. Important Disclaimer
 
 Requirements:
 - Mention RSI, MACD, and moving averages in the technical section.
 - Clearly state exactly one recommendation: BUY, HOLD, or SELL.
 - Include a confidence score from 0 to 100.
 - Include a risk level: Low, Medium, or High.
-- Keep it practical, polished, and under about 500 words.
+- Keep it practical and under about 450 words.
 """,
         )
         final_report = _extract_result_text(final_result)
-        return final_report, news_summary, technical_summary
+        return final_report, research_summary
     finally:
         await model_client.close()
 
@@ -483,7 +438,7 @@ def generate_ai_report(
     news_text: str,
     risk_profile: str,
     horizon: str,
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str]:
     return asyncio.run(
         _run_autogen_analysis(
             gemini_key=gemini_key,
@@ -569,7 +524,7 @@ with st.sidebar:
     period = st.selectbox("Chart period", ["3mo", "6mo", "1y"], index=1)
     horizon = st.selectbox("Investment horizon", ["Short-term", "Medium-term", "Long-term"], index=0)
     risk_profile = st.selectbox("Risk appetite", ["Conservative", "Moderate", "Aggressive"], index=1)
-    news_count = st.slider("News articles", 3, 10, 6)
+    news_count = st.slider("News articles", 3, 8, 4)
     run_analysis = st.button("🚀 Analyze Stock", use_container_width=True)
 
 
@@ -580,7 +535,7 @@ st.markdown(
     """
     <div class='hero'>
         <h1>📈 AI Stock Analyst Pro</h1>
-        <p class='muted'>Multi-agent stock analysis with AutoGen + Gemini, combining market news, technical indicators, and AI-generated investor summaries.</p>
+        <p class='muted'>Slick multi-agent stock analysis with AutoGen + Gemini, combining live market news, technical indicators, and investor-focused AI summaries.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -655,7 +610,7 @@ try:
 
     st.markdown("### 🤖 AI Investment Report")
     with st.spinner("Running AutoGen agents on Gemini..."):
-        report, news_summary, technical_summary = generate_ai_report(
+        report, research_summary = generate_ai_report(
             gemini_key=gemini_key,
             company_name=company_name,
             ticker=ticker,
@@ -675,20 +630,23 @@ try:
         unsafe_allow_html=True,
     )
 
-    inf1, inf2 = st.columns(2)
-    inf1.markdown(f"<div class='mini-card'><strong>Confidence</strong><br><span class='subtle'>{confidence}</span></div>", unsafe_allow_html=True)
-    inf2.markdown(f"<div class='mini-card'><strong>Risk Level</strong><br><span class='subtle'>{risk_level}</span></div>", unsafe_allow_html=True)
+    info1, info2 = st.columns(2)
+    info1.markdown(
+        f"<div class='mini-card'><strong>Confidence</strong><br><span class='subtle'>{confidence}</span></div>",
+        unsafe_allow_html=True,
+    )
+    info2.markdown(
+        f"<div class='mini-card'><strong>Risk Level</strong><br><span class='subtle'>{risk_level}</span></div>",
+        unsafe_allow_html=True,
+    )
 
-    tabs = st.tabs(["Final Report", "News Agent", "Technical Agent"])
+    tabs = st.tabs(["Final Report", "Research Agent"])
 
     with tabs[0]:
         st.markdown(report)
 
     with tabs[1]:
-        st.markdown(news_summary)
-
-    with tabs[2]:
-        st.markdown(technical_summary)
+        st.markdown(research_summary)
 
     st.download_button(
         "⬇️ Download report as Markdown",
@@ -700,10 +658,10 @@ try:
 
 except Exception as e:
     err = str(e).lower()
-    if "notfound" in err or "404" in err:
-        st.error("Gemini model or endpoint configuration was not accepted. Verify your Gemini key and deploy the updated app.")
-    elif "rate limit" in err or "too many requests" in err or "429" in err:
+    if "rate limit" in err or "too many requests" in err or "429" in err or "resource_exhausted" in err:
         st.warning("Rate limit reached. Please wait a bit and try again.")
+    elif "notfound" in err or "404" in err:
+        st.error("Gemini model or endpoint was not accepted. Please verify the updated code and API key.")
     else:
         st.error(f"Something went wrong: {e}")
     st.stop()
